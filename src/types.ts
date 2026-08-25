@@ -19,7 +19,16 @@ export type Task = {
   createdAt: number
 }
 
+export type Goal = {
+  id: string
+  title: string
+  completed: boolean
+  createdAt: number
+}
+
 export type Store = {
   projects: Project[]
   tasks: Task[]
+  goals: Goal[]
+  goalDueDate: string | null
 }

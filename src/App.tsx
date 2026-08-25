@@ -1,13 +1,13 @@
 import { useEffect, useMemo, useRef, useState, type MutableRefObject } from 'react'
-import type { Project, Store, Task } from './types'
+import type { Goal, Project, Store, Task } from './types'
 import { loadStore, saveStore } from './storage'
 import {
   IconBack,
   IconBattery,
   IconCheck,
-  IconChevron,
   IconClose,
   IconDots,
+  IconFlag,
   IconFlame,
   IconPlus,
   IconRepeat,
@@ -21,9 +21,11 @@ type Sheet =
   | { type: 'none' }
   | { type: 'add-task' }
   | { type: 'edit-task'; taskId: string }
-  | { type: 'add-list' }
   | { type: 'rename' }
   | { type: 'menu' }
+  | { type: 'add-goal' }
+  | { type: 'edit-goal'; goalId: string }
+  | { type: 'set-goal-date' }
 
 function pad(n: number) {
   return String(n).padStart(2, '0')
@@ -77,24 +79,69 @@ function dueLabel(iso: string, today: string) {
   return `${DAY_NAMES[(date.getDay() + 6) % 7]} ${date.getDate()}`
 }
 
+function endOfDueDate(iso: string) {
+  const d = fromISODate(iso)
+  d.setHours(23, 59, 59, 999)
+  return d
+}
+
+function goalCountLabel(total: number) {
+  if (total === 1) return '1 goal'
+  return `${total} goals`
+}
+
+function splitDuration(ms: number) {
+  const total = Math.max(0, Math.floor(ms / 1000))
+  return {
+    d: Math.floor(total / 86400),
+    h: Math.floor((total % 86400) / 3600),
+    m: Math.floor((total % 3600) / 60),
+    s: total % 60,
+  }
+}
+
+function isDeadlineOverdue(due: string | null, now: Date, allDone: boolean) {
+  if (!due || allDone) return false
+  return now.getTime() > endOfDueDate(due).getTime()
+}
+
 function useClock() {
-  const [now, setNow] = useState(() => new Date())
+  const [now, setNow] = useState(() => Date.now())
+
   useEffect(() => {
-    const id = setInterval(() => setNow(new Date()), 30_000)
-    return () => clearInterval(id)
+    let intervalId = 0
+    const tick = () => setNow(Date.now())
+
+    const timeoutId = window.setTimeout(() => {
+      tick()
+      intervalId = window.setInterval(tick, 1000)
+    }, 1000 - (Date.now() % 1000))
+
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') tick()
+    }
+    document.addEventListener('visibilitychange', onVisible)
+
+    return () => {
+      window.clearTimeout(timeoutId)
+      window.clearInterval(intervalId)
+      document.removeEventListener('visibilitychange', onVisible)
+    }
   }, [])
-  return now
+
+  return new Date(now)
 }
 
 export default function App() {
   const [store, setStore] = useState<Store>(loadStore)
-  const [openId, setOpenId] = useState<string | null>(() => loadStore().projects[0]?.id ?? null)
+  const [showGoals, setShowGoals] = useState(false)
   const [selectedDate, setSelectedDate] = useState(() => toISODate(new Date()))
   const [weekStart, setWeekStart] = useState(() => startOfWeek(new Date()))
   const [calOpen, setCalOpen] = useState(true)
   const [sheet, setSheet] = useState<Sheet>({ type: 'none' })
   const [draft, setDraft] = useState('')
   const [draftRepeat, setDraftRepeat] = useState(false)
+  const [draftDue, setDraftDue] = useState('')
   const inputRef = useRef<HTMLInputElement | HTMLTextAreaElement | null>(null)
   const now = useClock()
   const today = toISODate(now)
@@ -109,7 +156,11 @@ export default function App() {
     return () => clearTimeout(t)
   }, [sheet])
 
-  const project = store.projects.find((p) => p.id === openId) ?? null
+  const project = useMemo(() => {
+    const list = store.projects
+    if (list.length === 0) return null
+    return [...list].sort((a, b) => a.createdAt - b.createdAt)[0]
+  }, [store.projects])
   const weekDays = useMemo(
     () => Array.from({ length: 7 }, (_, i) => addDays(weekStart, i)),
     [weekStart],
@@ -136,28 +187,7 @@ export default function App() {
     setSheet({ type: 'none' })
     setDraft('')
     setDraftRepeat(false)
-  }
-
-  function openProject(id: string) {
-    setOpenId(id)
-    setSelectedDate(today)
-    setWeekStart(startOfWeek(new Date()))
-    setCalOpen(true)
-  }
-
-  function addProject() {
-    const name = draft.trim()
-    if (!name) return
-    const project: Project = {
-      id: crypto.randomUUID(),
-      name,
-      emoji: '✨',
-      notes: '',
-      createdAt: Date.now(),
-    }
-    updateStore((s) => ({ ...s, projects: [project, ...s.projects] }))
-    closeSheet()
-    openProject(project.id)
+    setDraftDue('')
   }
 
   function renameProject() {
@@ -168,16 +198,6 @@ export default function App() {
       ...s,
       projects: s.projects.map((p) => (p.id === project.id ? { ...p, name } : p)),
     }))
-    closeSheet()
-  }
-
-  function deleteProject() {
-    if (!project) return
-    updateStore((s) => ({
-      projects: s.projects.filter((p) => p.id !== project.id),
-      tasks: s.tasks.filter((t) => t.projectId !== project.id),
-    }))
-    setOpenId(null)
     closeSheet()
   }
 
@@ -270,12 +290,77 @@ export default function App() {
     setWeekStart((w) => addDays(w, dir * 7))
   }
 
-  const remainingFor = (id: string) =>
-    store.tasks.filter((t) => t.projectId === id && appearsOn(t, today) && !isDoneOn(t, today)).length
-
   const hasTasksOn = (iso: string) =>
     !!project &&
     store.tasks.some((t) => t.projectId === project.id && appearsOn(t, iso) && !isDoneOn(t, iso))
+
+  const goals = useMemo(
+    () =>
+      [...(store.goals ?? [])].sort(
+        (a, b) => Number(a.completed) - Number(b.completed) || a.createdAt - b.createdAt,
+      ),
+    [store.goals],
+  )
+  const openGoalCount = goals.filter((g) => !g.completed).length
+  const allGoalsDone = goals.length > 0 && openGoalCount === 0
+  const goalDueDate = store.goalDueDate ?? null
+
+  function openAddGoal() {
+    setDraft('')
+    setSheet({ type: 'add-goal' })
+  }
+
+  function openEditGoal(goal: Goal) {
+    setDraft(goal.title)
+    setSheet({ type: 'edit-goal', goalId: goal.id })
+  }
+
+  function openSetGoalDate() {
+    setDraftDue(goalDueDate || toISODate(addDays(new Date(), 30)))
+    setSheet({ type: 'set-goal-date' })
+  }
+
+  function addGoal() {
+    const title = draft.trim()
+    if (!title) return
+    const goal: Goal = {
+      id: crypto.randomUUID(),
+      title,
+      completed: false,
+      createdAt: Date.now(),
+    }
+    updateStore((s) => ({ ...s, goals: [goal, ...(s.goals ?? [])] }))
+    closeSheet()
+  }
+
+  function saveGoalEdit() {
+    if (sheet.type !== 'edit-goal') return
+    const title = draft.trim()
+    if (!title) return
+    updateStore((s) => ({
+      ...s,
+      goals: (s.goals ?? []).map((g) => (g.id === sheet.goalId ? { ...g, title } : g)),
+    }))
+    closeSheet()
+  }
+
+  function saveGoalDate() {
+    if (!draftDue) return
+    updateStore((s) => ({ ...s, goalDueDate: draftDue }))
+    closeSheet()
+  }
+
+  function deleteGoal(id: string) {
+    updateStore((s) => ({ ...s, goals: (s.goals ?? []).filter((g) => g.id !== id) }))
+    closeSheet()
+  }
+
+  function toggleGoal(id: string) {
+    updateStore((s) => ({
+      ...s,
+      goals: (s.goals ?? []).map((g) => (g.id === id ? { ...g, completed: !g.completed } : g)),
+    }))
+  }
 
   const sheetOpen = sheet.type !== 'none'
   const timeLabel = `${now.getHours()}:${pad(now.getMinutes())}`
@@ -293,15 +378,17 @@ export default function App() {
           </div>
         </div>
 
-        {!project ? (
+        {showGoals || !project ? (
           <Home
-            projects={store.projects}
-            remainingFor={remainingFor}
-            onOpen={openProject}
-            onAdd={() => {
-              setDraft('')
-              setSheet({ type: 'add-list' })
-            }}
+            goals={goals}
+            now={now}
+            goalDueDate={goalDueDate}
+            allGoalsDone={allGoalsDone}
+            onBack={project ? () => setShowGoals(false) : undefined}
+            onAddGoal={openAddGoal}
+            onSetGoalDate={openSetGoalDate}
+            onToggleGoal={toggleGoal}
+            onEditGoal={openEditGoal}
           />
         ) : (
           <ProjectView
@@ -309,12 +396,15 @@ export default function App() {
             weekDays={weekDays}
             selectedDate={selectedDate}
             today={today}
+            now={now}
             calOpen={calOpen}
             dayTasks={dayTasks}
             doneCount={doneCount}
             totalCount={totalCount}
             hasTasksOn={hasTasksOn}
-            onBack={() => setOpenId(null)}
+            goalCount={goals.length}
+            goalDueDate={goalDueDate}
+            allGoalsDone={allGoalsDone}
             onMenu={() => setSheet({ type: 'menu' })}
             onSelectDate={setSelectedDate}
             onToggleCal={() => setCalOpen((v) => !v)}
@@ -330,6 +420,7 @@ export default function App() {
               setDraftRepeat(false)
               setSheet({ type: 'add-task' })
             }}
+            onOpenGoals={() => setShowGoals(true)}
           />
         )}
 
@@ -352,26 +443,10 @@ export default function App() {
                   <button className="menu-item" onClick={clearCompleted}>
                     Clear completed
                   </button>
-                  <button className="menu-item danger" onClick={deleteProject}>
-                    Delete list
-                  </button>
                   <button className="menu-item" onClick={closeSheet}>
                     Cancel
                   </button>
                 </div>
-              )}
-
-              {sheet.type === 'add-list' && (
-                <SheetForm
-                  title="New list"
-                  placeholder="List name"
-                  value={draft}
-                  onChange={setDraft}
-                  onSubmit={addProject}
-                  onCancel={closeSheet}
-                  submitLabel="Create"
-                  inputRef={inputRef}
-                />
               )}
 
               {sheet.type === 'rename' && (
@@ -417,6 +492,43 @@ export default function App() {
                   onRepeatChange={setDraftRepeat}
                 />
               )}
+
+              {sheet.type === 'add-goal' && (
+                <SheetForm
+                  title="New goal"
+                  placeholder="What do you want to finish?"
+                  value={draft}
+                  onChange={setDraft}
+                  onSubmit={addGoal}
+                  onCancel={closeSheet}
+                  submitLabel="Add"
+                  inputRef={inputRef}
+                />
+              )}
+
+              {sheet.type === 'edit-goal' && (
+                <SheetForm
+                  title="Edit goal"
+                  placeholder="Goal"
+                  value={draft}
+                  onChange={setDraft}
+                  onSubmit={saveGoalEdit}
+                  onCancel={closeSheet}
+                  submitLabel="Save"
+                  inputRef={inputRef}
+                  onDelete={() => deleteGoal(sheet.goalId)}
+                />
+              )}
+
+              {sheet.type === 'set-goal-date' && (
+                <DateForm
+                  due={draftDue}
+                  onDueChange={setDraftDue}
+                  onSubmit={saveGoalDate}
+                  onCancel={closeSheet}
+                  inputRef={inputRef}
+                />
+              )}
             </div>
           </div>
         )}
@@ -426,45 +538,65 @@ export default function App() {
 }
 
 function Home({
-  projects,
-  remainingFor,
-  onOpen,
-  onAdd,
+  goals,
+  now,
+  goalDueDate,
+  allGoalsDone,
+  onBack,
+  onAddGoal,
+  onSetGoalDate,
+  onToggleGoal,
+  onEditGoal,
 }: {
-  projects: Project[]
-  remainingFor: (id: string) => number
-  onOpen: (id: string) => void
-  onAdd: () => void
+  goals: Goal[]
+  now: Date
+  goalDueDate: string | null
+  allGoalsDone: boolean
+  onBack?: () => void
+  onAddGoal: () => void
+  onSetGoalDate: () => void
+  onToggleGoal: (id: string) => void
+  onEditGoal: (goal: Goal) => void
 }) {
   return (
     <div className="screen home">
-      <header className="home-header">
-        <h1>My Lists</h1>
-        <button className="icon-btn add-list-btn" onClick={onAdd} aria-label="New list">
+      <header className="nav">
+        {onBack ? (
+          <button className="nav-back" onClick={onBack} aria-label="Back">
+            <IconBack />
+          </button>
+        ) : (
+          <span className="nav-spacer" />
+        )}
+        <h1 className="nav-title">Goals</h1>
+        <button className="nav-back add-list-btn" onClick={onAddGoal} aria-label="New goal">
           <IconPlus size={20} />
         </button>
       </header>
 
-      <div className="list-stack">
-        {projects.map((p) => {
-          const left = remainingFor(p.id)
-          return (
-            <button key={p.id} className="list-card" onClick={() => onOpen(p.id)}>
-              <span className="list-emoji">{p.emoji}</span>
-              <span className="list-copy">
-                <span className="list-name">{p.name}</span>
-                <span className="list-meta">{left === 0 ? 'All clear for today' : `${left} left today`}</span>
-              </span>
-              <IconChevron className="list-chevron" />
-            </button>
-          )
-        })}
+      <TimerHero
+        dueDate={goalDueDate}
+        now={now}
+        done={allGoalsDone}
+        label={goalCountLabel(goals.length)}
+        onClick={onSetGoalDate}
+      />
 
-        <button className="list-card new" onClick={onAdd}>
+      <div className="goal-stack">
+        {goals.map((goal) => (
+          <GoalCard
+            key={goal.id}
+            goal={goal}
+            onToggle={() => onToggleGoal(goal.id)}
+            onEdit={() => onEditGoal(goal)}
+          />
+        ))}
+
+        <button className="list-card new" onClick={onAddGoal}>
           <span className="list-plus">+</span>
           <span className="list-copy">
-            <span className="list-name">New list</span>
-            <span className="list-meta">Start a fresh project</span>
+            <span className="list-name">New goal</span>
+            <span className="list-meta">Add to the list</span>
           </span>
         </button>
       </div>
@@ -477,12 +609,15 @@ function ProjectView({
   weekDays,
   selectedDate,
   today,
+  now,
   calOpen,
   dayTasks,
   doneCount,
   totalCount,
   hasTasksOn,
-  onBack,
+  goalCount,
+  goalDueDate,
+  allGoalsDone,
   onMenu,
   onSelectDate,
   onToggleCal,
@@ -490,17 +625,21 @@ function ProjectView({
   onToggleTask,
   onEditTask,
   onAdd,
+  onOpenGoals,
 }: {
   project: Project
   weekDays: Date[]
   selectedDate: string
   today: string
+  now: Date
   calOpen: boolean
   dayTasks: Task[]
   doneCount: number
   totalCount: number
   hasTasksOn: (iso: string) => boolean
-  onBack: () => void
+  goalCount: number
+  goalDueDate: string | null
+  allGoalsDone: boolean
   onMenu: () => void
   onSelectDate: (iso: string) => void
   onToggleCal: () => void
@@ -508,6 +647,7 @@ function ProjectView({
   onToggleTask: (id: string) => void
   onEditTask: (task: Task) => void
   onAdd: () => void
+  onOpenGoals: () => void
 }) {
   const touchX = useRef<number | null>(null)
   const lastShift = useRef(0)
@@ -515,14 +655,20 @@ function ProjectView({
   return (
     <div className="screen project">
       <header className="nav">
-        <button className="nav-back" onClick={onBack} aria-label="Back">
-          <IconBack />
-        </button>
+        <span className="nav-spacer" />
         <h1 className="nav-title">{project.name}</h1>
         <button className="nav-menu" onClick={onMenu} aria-label="More">
           <IconDots />
         </button>
       </header>
+
+      <TimerHero
+        dueDate={goalDueDate}
+        now={now}
+        done={allGoalsDone}
+        label={goalCountLabel(goalCount)}
+        onClick={onOpenGoals}
+      />
 
       {calOpen && (
         <div
@@ -718,5 +864,162 @@ function SheetForm({
         </div>
       </div>
     </>
+  )
+}
+
+function DateForm({
+  due,
+  onDueChange,
+  onSubmit,
+  onCancel,
+  inputRef,
+}: {
+  due: string
+  onDueChange: (v: string) => void
+  onSubmit: () => void
+  onCancel: () => void
+  inputRef: MutableRefObject<HTMLInputElement | HTMLTextAreaElement | null>
+}) {
+  return (
+    <>
+      <div className="sheet-head">
+        <h3 className="sheet-title">Finish by</h3>
+        <button className="icon-btn subtle" onClick={onCancel} aria-label="Close">
+          <IconClose />
+        </button>
+      </div>
+      <p className="sheet-note">Every goal shares this date. The timer runs until they are all done.</p>
+      <label className="date-row">
+        <span className="date-copy">
+          <IconFlag size={16} />
+          Date
+        </span>
+        <input
+          ref={(el) => {
+            inputRef.current = el
+          }}
+          type="date"
+          className="date-input"
+          value={due}
+          onChange={(e) => onDueChange(e.target.value)}
+        />
+      </label>
+      <div className="sheet-actions">
+        <div className="sheet-actions-right">
+          <button className="btn ghost" onClick={onCancel}>
+            Cancel
+          </button>
+          <button className="btn primary" onClick={onSubmit} disabled={!due}>
+            Save
+          </button>
+        </div>
+      </div>
+    </>
+  )
+}
+
+function GoalCard({
+  goal,
+  onToggle,
+  onEdit,
+}: {
+  goal: Goal
+  onToggle: () => void
+  onEdit: () => void
+}) {
+  const done = goal.completed
+  return (
+    <div className={`goal-card ${done ? 'done' : ''}`}>
+      <button className="check" onClick={onToggle} aria-label={done ? 'Mark incomplete' : 'Complete'}>
+        {done ? (
+          <span className="check-on">
+            <IconCheck />
+          </span>
+        ) : (
+          <span className="check-off" />
+        )}
+      </button>
+      <button className="goal-body" onClick={onEdit}>
+        <span className="goal-title">{goal.title}</span>
+      </button>
+    </div>
+  )
+}
+
+function TimerHero({
+  dueDate,
+  now,
+  done,
+  label,
+  onClick,
+}: {
+  dueDate: string | null
+  now: Date
+  done: boolean
+  label: string
+  onClick: () => void
+}) {
+  const overdue = isDeadlineOverdue(dueDate, now, done)
+  return (
+    <button
+      className={`timer-hero ${!dueDate ? 'add' : ''} ${done ? 'done' : ''} ${overdue ? 'overdue' : ''}`}
+      onClick={onClick}
+    >
+      {dueDate ? (
+        <>
+          <Countdown dueDate={dueDate} done={done} now={now} size="big" />
+          <span className="timer-label">{label}</span>
+        </>
+      ) : (
+        <>
+          <span className="timer-empty">Set a finish date</span>
+          <span className="timer-label">{label}</span>
+        </>
+      )}
+    </button>
+  )
+}
+
+function Countdown({
+  dueDate,
+  done,
+  now,
+  size = 'normal',
+}: {
+  dueDate: string
+  done: boolean
+  now: Date
+  size?: 'normal' | 'big'
+}) {
+  if (done) {
+    return <div className={`timer-finished ${size}`}>{size === 'big' ? 'Done' : 'Finished'}</div>
+  }
+
+  const diff = endOfDueDate(dueDate).getTime() - now.getTime()
+  const overdue = diff < 0
+  const parts = splitDuration(Math.abs(diff))
+  const ticks = [
+    { n: String(parts.d), u: 'd' },
+    { n: pad(parts.h), u: 'h' },
+    { n: pad(parts.m), u: 'm' },
+    { n: pad(parts.s), u: 's' },
+  ]
+
+  return (
+    <div className={`countdown ${size} ${overdue ? 'overdue' : ''}`} aria-live="off">
+      {ticks.map((tick, i) => (
+        <span key={tick.u} className="tick-group">
+          {i > 0 && size === 'big' && (
+            <span className="tick-sep" aria-hidden>
+              :
+            </span>
+          )}
+          <span className="tick">
+            <span className="tick-num">{tick.n}</span>
+            <span className="tick-unit">{tick.u}</span>
+          </span>
+        </span>
+      ))}
+    </div>
   )
 }

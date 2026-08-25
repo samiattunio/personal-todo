@@ -149,6 +149,20 @@ export function IconRepeat({ size = 14, className }: IconProps) {
   )
 }
 
+export function IconFlag({ size = 16, className }: IconProps) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" className={className} aria-hidden>
+      <path d="M6 21V4" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" />
+      <path
+        d="M6 4.5h11.2l-2.1 3.7 2.1 3.8H6"
+        stroke="currentColor"
+        strokeWidth="1.9"
+        strokeLinejoin="round"
+      />
+    </svg>
+  )
+}
+
 export function IconClose({ size = 18, className }: IconProps) {
   return (
     <svg width={size} height={size} viewBox="0 0 24 24" fill="none" className={className} aria-hidden>
